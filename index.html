@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tinnitus Curve → Auto Bands (with LR Edges & Spectrum)</title>
+<style>
+  body { background:#111; color:#eee; font-family:sans-serif; text-align:center; padding:20px; }
+  table { margin:20px auto; border-collapse:collapse; }
+  th,td { padding:6px 10px; border-bottom:1px solid #333; }
+  input, select { background:#222; color:#fff; border:1px solid #444; border-radius:5px; padding:4px; }
+  input[type=number]{ width:90px; }
+  button { padding:10px 18px; margin:10px; background:#444; color:#fff; border:none; border-radius:6px; cursor:pointer; }
+  button:hover{ background:#666; }
+  canvas { width:85%; height:220px; background:#000; border-radius:10px; margin-top:20px; }
+  .row { margin:8px 0; }
+</style>
+</head>
+<body>
+
+<h2>🎧 Tinnitus Curve → Multi-Band (Auto-Q) + LR Edges + Spectrum</h2>
+
+<div class="row">
+  Noise:
+  <select id="noiseType">
+    <option value="white">White</option>
+    <option value="pink">Pink</option>
+  </select>
+  &nbsp; Overlap α:
+  <input id="alpha" type="number" step="0.05" value="1.25">
+  &nbsp; Edge ε:
+  <input id="epsilon" type="number" step="0.01" value="0.03">
+  &nbsp; Edge order (pairs):
+  <select id="edgePairs">
+    <option value="2">LR4 (−24 dB/oct)</option>
+    <option value="3">LR6 (−36 dB/oct)</option>
+  </select>
+  &nbsp; Master Gain:
+  <input id="masterGain" type="number" step="0.05" value="0.4">
+</div>
+
+<table id="curve">
+  <tr><th>Freq (Hz)</th><th>Gain (0–1)</th></tr>
+  <tr><td><input value="1800" type="number"></td><td><input value="0.1" type="number" step="0.05"></td></tr>
+  <tr><td><input value="1900" type="number"></td><td><input value="0.5" type="number" step="0.05"></td></tr>
+  <tr><td><input value="2000" type="number"></td><td><input value="0.7" type="number" step="0.05"></td></tr>
+  <tr><td><input value="2100" type="number"></td><td><input value="1.0" type="number" step="0.05"></td></tr>
+  <tr><td><input value="2200" type="number"></td><td><input value="0.9" type="number" step="0.05"></td></tr>
+  <tr><td><input value="2300" type="number"></td><td><input value="0.6" type="number" step="0.05"></td></tr>
+  <tr><td><input value="2400" type="number"></td><td><input value="0.1" type="number" step="0.05"></td></tr>
+</table>
+
+<button id="play">▶ Play</button>
+<button id="stop">⏹ Stop</button>
+<canvas id="spec"></canvas>
+
+<script>
+let audioCtx, source, analyser, animationId;
+let master, nodesToStop = [];
+
+function readCurve() {
+  const rows = document.querySelectorAll("#curve tr");
+  const pts = [];
+  rows.forEach((r,i)=>{
+    if(i===0) return;
+    const [fEl,gEl] = r.querySelectorAll("input");
+    const f = parseFloat(fEl.value), g = parseFloat(gEl.value);
+    if(!isNaN(f) && !isNaN(g)) pts.push({freq:f, gain:Math.max(0, g)});
+  });
+  // sırala ve aynı frekansı temizle
+  pts.sort((a,b)=>a.freq-b.freq);
+  const unique = [];
+  for (const p of pts){
+    if(!unique.length || Math.abs(unique[unique.length-1].freq - p.freq) > 1e-6) unique.push(p);
+    else unique[unique.length-1] = p; // sonuncuyu güncelle
+  }
+  return unique;
+}
+
+function createNoise(ctx, type="white", dur=2){
+  const buf = ctx.createBuffer(1, dur*ctx.sampleRate, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  if(type==="white"){
+    for(let i=0;i<data.length;i++) data[i] = Math.random()*2-1;
+  } else {
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+    for(let i=0;i<data.length;i++){
+      const white=Math.random()*2-1;
+      b0=0.99886*b0+white*0.0555179;
+      b1=0.99332*b1+white*0.0750759;
+      b2=0.96900*b2+white*0.1538520;
+      b3=0.86650*b3+white*0.3104856;
+      b4=0.55000*b4+white*0.5329522;
+      b5=-0.7616*b5-white*0.0168980;
+      data[i]=b0+b1+b2+b3+b4+b5+b6+white*0.5362;
+      data[i]*=0.11; b6=white*0.115926;
+    }
+  }
+  return buf;
+}
+
+// Linkwitz-Riley (yaklaşık LR4) için: aynı cutoff'ta iki adet 2. derece Butterworth (Q=0.707) arka arkaya
+function addEdgeFilter(ctx, inputNode, type, cutoff, pairs=2){
+  let node = inputNode;
+  for (let k=0;k<pairs;k++){
+    const biq = ctx.createBiquadFilter();
+    biq.type = type; // "highpass" veya "lowpass"
+    biq.frequency.value = cutoff;
+    biq.Q.value = 0.707;
+    node.connect(biq);
+    node = biq;
+    nodesToStop.push(biq);
+  }
+  return node;
+}
+
+function buildGraph(){
+  const points = readCurve();
+  if (points.length < 2) { alert("En az iki nokta girin."); return; }
+
+  const alpha = parseFloat(document.getElementById("alpha").value) || 1.25;
+  const eps = parseFloat(document.getElementById("epsilon").value) || 0.03;
+  const edgePairs = parseInt(document.getElementById("edgePairs").value) || 2;
+  const noiseType = document.getElementById("noiseType").value;
+  const masterGain = parseFloat(document.getElementById("masterGain").value) || 0.4;
+
+  // kaynak
+  source = audioCtx.createBufferSource();
+  source.buffer = createNoise(audioCtx, noiseType);
+  source.loop = true;
+  nodesToStop.push(source);
+
+  // paralel bant toplama düğümü
+  const sum = audioCtx.createGain();
+  sum.gain.value = 1.0;
+  nodesToStop.push(sum);
+
+  // her ardışık çift için bir band
+  for (let i=0;i<points.length-1;i++){
+    const f1 = points[i].freq, g1 = points[i].gain;
+    const f2 = points[i+1].freq, g2 = points[i+1].gain;
+    const f0 = Math.sqrt(f1*f2);
+    const BW = Math.max(5, alpha * (f2 - f1)); // en az 5 Hz emniyet
+    const Q = Math.min(40, Math.max(1, f0 / BW)); // pratik sınırlar
+    const g = Math.sqrt(Math.max(1e-6,g1) * Math.max(1e-6,g2)); // geometrik ortalama
+
+    const bp = audioCtx.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.value = f0;
+    bp.Q.value = Q;
+
+    const gain = audioCtx.createGain();
+    gain.gain.value = g;
+
+    source.connect(bp);
+    bp.connect(gain);
+    gain.connect(sum);
+
+    nodesToStop.push(bp, gain);
+  }
+
+  // kenar HPF/LPF (0 enerji dışarıda) — güvenlik payı ile
+  const fmin = points[0].freq, fmax = points[points.length-1].freq;
+  const hCut = fmin * Math.max(0.0001, (1 - eps));
+  const lCut = fmax * (1 + eps);
+
+  // HPF zinciri
+  const afterHP = addEdgeFilter(audioCtx, sum, "highpass", hCut, edgePairs);
+  // LPF zinciri
+  const afterLP = addEdgeFilter(audioCtx, afterHP, "lowpass", lCut, edgePairs);
+
+  // master + analizör
+  master = audioCtx.createGain();
+  master.gain.value = masterGain;
+  afterLP.connect(master);
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  master.connect(analyser);
+  analyser.connect(audioCtx.destination);
+}
+
+function drawSpectrum(){
+  const canvas = document.getElementById("spec");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const bins = new Uint8Array(analyser.frequencyBinCount);
+
+  function loop(){
+    animationId = requestAnimationFrame(loop);
+    analyser.getByteFrequencyData(bins);
+    ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+
+    const barW = (W / bins.length);
+    for (let i=0;i<bins.length;i++){
+      const v = bins[i]/255;
+      const h = v*H;
+      ctx.fillStyle = `rgb(${Math.round(255*v)}, ${Math.round(180*(1-v))}, 200)`;
+      ctx.fillRect(i*barW, H-h, barW, h);
+    }
+  }
+  loop();
+}
+
+document.getElementById("play").onclick = ()=>{
+  if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  buildGraph();
+  source.start();
+  drawSpectrum();
+};
+
+document.getElementById("stop").onclick = ()=>{
+  if (source) { try{source.stop();}catch{} }
+  if (animationId) cancelAnimationFrame(animationId);
+  nodesToStop = [];
+};
+</script>
+</body>
+</html>
